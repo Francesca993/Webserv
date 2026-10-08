@@ -1,0 +1,1787 @@
+#include "Client.hpp"
+#include "Config.hpp"
+#include "Server.hpp"
+#include "webserv.hpp"
+#include <cstdio>
+#include <iostream>
+#include <unistd.h>
+
+Client::Client(int fd) : client_fd(fd), bytes_sent(0), headers_too_large(false), body_too_large(false), cgi_fd(-1), cgi_in_fd(-1), cgi_pid(-1), last_activity(time(NULL)) {}
+
+Client::Client() : client_fd(-1), bytes_sent(0), headers_too_large(false), body_too_large(false), cgi_fd(-1), cgi_in_fd(-1), cgi_pid(-1), last_activity(time(NULL)) {}
+
+Client::~Client() {}
+
+int Client::get_fd() const
+{
+    return this->client_fd;
+}
+
+void Client::set_fd(int fd)
+{
+    this->client_fd = fd;
+}
+
+const std::string &Client::get_request() const
+{
+    return this->request_buffer;
+}
+
+bool Client::is_headers_too_large() const
+{
+    return (this->headers_too_large);
+}
+
+bool Client::is_body_too_large() const
+{
+    return this->body_too_large;
+}
+
+const std::string &Client::get_query_string() const
+{
+    return this->req.query_string;
+}
+
+time_t Client::get_last_activity() const
+{
+    return this->last_activity;
+}
+
+void Client::update_last_activity()
+{
+    this->last_activity = time(NULL);
+}
+
+bool Client::prepare_error_response(int error_code, const ServerConfig &config)
+{
+    if (!this->clear_response())
+        return false;
+
+    this->res.headers.clear();
+
+    if (this->req.version.empty())
+        this->req.version = "HTTP/1.1";
+
+    build_error_response(error_code, config, NULL);
+    build_response_buffer();
+
+    return true;
+}
+
+void Client::print_request() const
+{
+    std::cout << "\n--- REQUEST ---" << std::endl;
+    std::cout << "Method: " << req.method << std::endl;
+    std::cout << "Path: " << req.path << std::endl;
+    std::cout << "Version: " << req.version << std::endl;
+    for (std::map<std::string, std::string>::const_iterator it = req.headers.begin(); it != req.headers.end(); ++it)
+        std::cout << it->first << ": " << it->second << std::endl;
+    // if (!req.body.empty())
+    //     std::cout << "Body: " << req.body << std::endl;
+    std::cout << "---------" << std::endl;
+}
+
+void Client::print_response() const
+{
+    std::cout << "\n--- RESPONSE ---" << std::endl;
+    //    std::cout << this->response_buffer << std::endl;
+    std::cout << "---------" << std::endl;
+}
+
+bool Client::has_full_headers(const char *data, size_t len)
+{
+    this->request_buffer.append(data, len);
+
+    size_t headers_end = this->request_buffer.find("\r\n\r\n");
+
+    if (headers_end != std::string::npos)
+    {
+        if (headers_end + 4 > MAX_HEADER_SIZE)
+        {
+            this->headers_too_large = true;
+            return false;
+        }
+        return true;
+    }
+
+    if (this->request_buffer.size() > MAX_HEADER_SIZE)
+    {
+        this->headers_too_large = true;
+        return false;
+    }
+
+    return false;
+}
+
+void Client::clear_request()
+{
+    this->request_buffer.clear();
+    this->req = HttpRequest();
+}
+
+bool Client::req_done() const
+{
+    return (req.state == HttpRequest::DONE);
+}
+
+bool Client::req_error() const
+{
+    return req.state == HttpRequest::ERROR;
+}
+
+bool Client::parse_request_line(std::size_t &pos)
+{
+    size_t end = this->request_buffer.find("\r\n");
+    std::string line = this->request_buffer.substr(0, end);
+    size_t first_space = line.find(' ');
+    size_t second_space = line.find(' ', first_space + 1);
+
+    if (first_space == std::string::npos || second_space == std::string::npos)
+    {
+        req.state = HttpRequest::ERROR;
+        return true;
+    }
+
+    if (line.find(' ', second_space + 1) != std::string::npos)
+    {
+        req.state = HttpRequest::ERROR;
+        return true;
+    }
+
+    req.method = line.substr(0, first_space);
+    req.path = line.substr(first_space + 1, second_space - first_space - 1);
+    req.version = line.substr(second_space + 1);
+
+    if (req.method.empty() || req.path.empty() || req.path[0] != '/')
+    {
+        req.state = HttpRequest::ERROR;
+        return true;
+    }
+
+    size_t query_pos = req.path.find('?');
+    if (query_pos != std::string::npos)
+    {
+        req.query_string = req.path.substr(query_pos + 1);
+        req.path = req.path.substr(0, query_pos);
+    }
+
+    if (req.version.compare(0, 5, "HTTP/") != 0)
+    {
+        req.state = HttpRequest::ERROR;
+        return true;
+    }
+
+    pos = end + 2;
+    req.state = HttpRequest::PARSING_HEADERS;
+    return true;
+}
+
+bool Client::parse_header_line(const std::string &line)
+{
+    size_t colon = line.find(':');
+    if (colon == std::string::npos || colon == 0)
+        return false;
+
+    std::string key = line.substr(0, colon);
+
+    if (key.find_first_of(" \t") != std::string::npos)
+        return false;
+
+    to_lower(key);
+    req.headers[key] = trim(line.substr(colon + 1));
+    return true;
+}
+
+bool Client::parse_headers(std::size_t &pos)
+{
+    size_t headers_end = this->request_buffer.find("\r\n\r\n");
+    size_t line_start = pos;
+
+    while (line_start < headers_end)
+    {
+        size_t line_end = this->request_buffer.find("\r\n", line_start);
+        std::string line = this->request_buffer.substr(line_start, line_end - line_start);
+
+        if (!parse_header_line(line))
+        {
+            req.state = HttpRequest::ERROR;
+            return true;
+        }
+        line_start = line_end + 2;
+    }
+
+    if (req.headers.count("host") == 0)
+    {
+        req.state = HttpRequest::ERROR;
+        return true;
+    }
+
+    pos = headers_end + 4;
+    req.body_start = pos;
+    req.state = HttpRequest::PARSING_BODY;
+    return true;
+}
+
+bool hex_to_size(const std::string &s, size_t &result)
+{
+    if (s.empty() || s.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+        return false;
+
+    std::stringstream ss(s);
+
+    ss >> std::hex >> result;
+
+    return !ss.fail();
+}
+
+bool Client::parse_chunked_body(std::size_t pos, std::size_t max_body_size)
+{
+    if (req.chunk_pos == 0)
+        req.chunk_pos = pos;
+
+    while (true)
+    {
+        if (!req.chunk_size_read)
+        {
+            size_t line_end = this->request_buffer.find("\r\n", req.chunk_pos);
+
+            if (line_end == std::string::npos)
+                return true;
+
+            size_t chunk_size;
+
+            if (!hex_to_size(this->request_buffer.substr(req.chunk_pos, line_end - req.chunk_pos), chunk_size))
+            {
+                if (DEBUG)
+                    std::cout << "chunked: hex non valido" << std::endl;
+                req.state = HttpRequest::ERROR;
+                return true;
+            }
+
+            req.chunk_pos = line_end + 2;
+
+            if (chunk_size == 0)
+            {
+                req.state = HttpRequest::DONE;
+                return true;
+            }
+
+            if (req.body.size() + chunk_size > max_body_size)
+            {
+                if (DEBUG)
+                    std::cout << "chunked: limite superato "
+                              << req.body.size() + chunk_size << " > " << max_body_size << std::endl;
+                this->body_too_large = true;
+                req.state = HttpRequest::ERROR;
+                return true;
+            }
+
+            req.chunk_remaining = chunk_size;
+            req.chunk_size_read = true;
+        }
+
+        size_t available = this->request_buffer.size() - req.chunk_pos;
+
+        if (available > req.chunk_remaining)
+            available = req.chunk_remaining;
+
+        if (available > 0)
+        {
+            req.body.append(this->request_buffer, req.chunk_pos, available);
+            req.chunk_pos += available;
+            req.chunk_remaining -= available;
+        }
+
+        if (req.chunk_remaining > 0)
+            return true;
+
+        if (this->request_buffer.size() < req.chunk_pos + 2)
+            return true;
+
+        if (this->request_buffer[req.chunk_pos] != '\r' ||
+            this->request_buffer[req.chunk_pos + 1] != '\n')
+        {
+            if (DEBUG)
+                std::cout << "chunked: CRLF mancante a " << req.chunk_pos << std::endl;
+            req.state = HttpRequest::ERROR;
+            return true;
+        }
+
+        req.chunk_pos += 2;
+        req.chunk_size_read = false;
+    }
+}
+
+bool Client::parse_body(std::size_t &pos, std::size_t max_body_size)
+{
+    std::string t = get_header("transfer-encoding");
+
+    to_lower(t);
+
+    if (t == "chunked")
+        return parse_chunked_body(pos, max_body_size);
+
+    if (req.headers.count("content-length"))
+    {
+        const std::string &cl = req.headers["content-length"];
+
+        if (cl.empty())
+        {
+            req.state = HttpRequest::ERROR;
+            return true;
+        }
+
+        std::size_t content_length = 0;
+        bool too_large = false;
+
+        for (size_t i = 0; i < cl.size(); ++i)
+        {
+            unsigned char c = static_cast<unsigned char>(cl[i]);
+
+            if (!isdigit(c))
+            {
+                req.state = HttpRequest::ERROR;
+                return true;
+            }
+
+            if (!too_large)
+            {
+                std::size_t d = static_cast<std::size_t>(c - '0');
+
+                const std::size_t size_max = static_cast<std::size_t>(-1);
+
+                if (content_length > (size_max - d) / 10)
+                    too_large = true;
+                else
+                {
+                    content_length = content_length * 10 + d;
+
+                    if (content_length > max_body_size)
+                        too_large = true;
+                }
+            }
+        }
+
+        if (too_large)
+        {
+            this->body_too_large = true;
+            req.state = HttpRequest::ERROR;
+            return true;
+        }
+
+        size_t available = this->request_buffer.size() - pos;
+        if (available < content_length)
+            return true;
+        req.body = this->request_buffer.substr(pos, content_length);
+        pos += content_length;
+    }
+    req.state = HttpRequest::DONE;
+    return true;
+}
+
+bool Client::parse_request(const ServerConfig &config)
+{
+    std::size_t pos = 0;
+    if (req.state == HttpRequest::PARSING_BODY)
+        pos = req.body_start;
+
+    while (pos < this->request_buffer.size() || req.state == HttpRequest::PARSING_BODY)
+    {
+        switch (req.state)
+        {
+        case HttpRequest::PARSING_REQUEST_LINE:
+            if (!parse_request_line(pos))
+                return false;
+            break;
+        case HttpRequest::PARSING_HEADERS:
+            if (!parse_headers(pos))
+                return false;
+            break;
+        case HttpRequest::PARSING_BODY:
+        {
+            const LocationConfig *loc = match_location(config);
+
+            if (loc)
+                return parse_body(pos, loc->location_max_body_size);
+
+            return parse_body(pos, config.client_max_body_size);
+        }
+        case HttpRequest::DONE:
+            return true;
+        case HttpRequest::ERROR:
+            return true;
+        }
+    }
+    return false;
+}
+
+int Client::get_cgi_fd() const
+{
+    return this->cgi_fd;
+}
+
+int Client::get_cgi_in_fd() const
+{
+    return this->cgi_in_fd;
+}
+
+pid_t Client::get_cgi_pid() const
+{
+    return this->cgi_pid;
+}
+
+void Client::clear_cgi()
+{
+    this->cgi_fd = -1;
+    this->cgi_in_fd = -1;
+    this->cgi_pid = -1;
+}
+
+const std::string &Client::get_method() const
+{
+    return this->req.method;
+}
+
+const std::string &Client::get_path() const
+{
+    return this->req.path;
+}
+
+const std::string &Client::get_version() const
+{
+    return this->req.version;
+}
+
+const std::string &Client::get_body() const
+{
+    return this->req.body;
+}
+
+std::string Client::get_header(const std::string &key) const
+{
+    std::string lower(key);
+    to_lower(lower);
+
+    std::map<std::string, std::string>::const_iterator it = this->req.headers.find(lower);
+    if (it == this->req.headers.end())
+        return "";
+    return it->second;
+}
+
+const std::string &Client::get_response() const
+{
+    return this->response_buffer;
+}
+
+std::size_t Client::get_bytes_sent() const
+{
+    return this->bytes_sent;
+}
+
+void Client::add_bytes_sent(std::size_t bytes)
+{
+    this->bytes_sent += bytes;
+}
+
+bool Client::clear_response()
+{
+    if (this->bytes_sent < this->response_buffer.size())
+        return false;
+
+    this->response_buffer.clear();
+    this->bytes_sent = 0;
+    return true;
+}
+
+void Client::build_response_buffer()
+{
+    std::stringstream ss;
+
+    this->res.version = "HTTP/1.1";
+    ss << this->res.version << " " << this->res.status_code << " " << this->res.reason << "\r\n";
+
+    if (!this->res.content_type.empty())
+        ss << "Content-Type: " << this->res.content_type << "\r\n";
+
+    ss << "Content-Length: " << this->res.body.size() << "\r\n";
+
+    for (std::map<std::string, std::string>::const_iterator it = this->res.headers.begin();
+         it != this->res.headers.end(); ++it)
+    {
+        std::string key(it->first);
+        to_lower(key);
+
+        if (key == "content-type" || key == "content-length" || key == "connection")
+            continue;
+
+        ss << it->first << ": " << it->second << "\r\n";
+    }
+
+    ss << "Connection: close\r\n";
+    ss << "\r\n";
+    ss << this->res.body;
+
+    this->response_buffer = ss.str();
+    this->bytes_sent = 0;
+}
+
+void Client::build_default_error_response(int error_code)
+{
+    std::string reason = get_error_reason(error_code);
+
+    if (reason == "Internal Server Error" && error_code != 500)
+    {
+        error_code = 500;
+        reason = "Internal Server Error";
+    }
+
+    this->res.status_code = error_code;
+    this->res.reason = reason;
+    this->res.content_type = "text/html";
+
+    std::stringstream body;
+
+    body << "<html>" << "<head><title>" << error_code << " " << reason << "</title></head>" << "<body>" << "<h1>" << error_code << " " << reason << "</h1>" << "</body>" << "</html>";
+
+    this->res.body = body.str();
+}
+
+std::string Client::get_error_reason(int error_code) const
+{
+    std::map<int, std::string> error_codes;
+
+    error_codes[400] = "Bad Request";
+    error_codes[403] = "Forbidden";
+    error_codes[404] = "Not Found";
+    error_codes[405] = "Method Not Allowed";
+    error_codes[409] = "Conflict";
+    error_codes[413] = "Payload Too Large";
+    error_codes[431] = "Request Header Fields Too Large";
+    error_codes[500] = "Internal Server Error";
+    error_codes[501] = "Not Implemented";
+    error_codes[502] = "Bad Gateway";
+    error_codes[504] = "Gateway Timeout";
+    error_codes[505] = "HTTP Version Not Supported";
+
+    std::map<int, std::string>::const_iterator it = error_codes.find(error_code);
+
+    if (it == error_codes.end())
+        it = error_codes.find(500);
+
+    return it->second;
+}
+void Client::build_error_response(int error_code, const ServerConfig &config, const LocationConfig *loc)
+{
+    std::string error_page_path;
+    std::map<int, std::string>::const_iterator it;
+
+    if (loc)
+    {
+        it = loc->error_pages.find(error_code);
+
+        if (it != loc->error_pages.end())
+            error_page_path = it->second;
+    }
+
+    if (error_page_path.empty())
+    {
+        it = config.error_pages.find(error_code);
+
+        if (it != config.error_pages.end())
+            error_page_path = it->second;
+    }
+    
+    if (!error_page_path.empty())
+    {
+        std::string body;
+        int read_status = read_file(error_page_path, body);
+
+        if (read_status == 200)
+        {
+            this->res.status_code = error_code;
+            this->res.reason = get_error_reason(error_code);
+            this->res.content_type = get_content_type(error_page_path);
+            this->res.body = body;
+            return;
+        }
+    }
+
+    build_default_error_response(error_code);
+}
+
+static std::string html_escape(const std::string &s)
+{
+    std::string escaped;
+
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '&')
+            escaped += "&amp;";
+        else if (s[i] == '<')
+            escaped += "&lt;";
+        else if (s[i] == '>')
+            escaped += "&gt;";
+        else if (s[i] == '"')
+            escaped += "&quot;";
+        else
+            escaped += s[i];
+    }
+    return escaped;
+}
+
+static std::string join_url_path(const std::string &base, const std::string &name)
+{
+    if (base.empty())
+        return "/" + name;
+    if (base[base.size() - 1] == '/')
+        return base + name;
+    return base + "/" + name;
+}
+
+static int build_autoindex_body(const std::string &dir_path, const std::string &request_path, std::string &body)
+{
+    DIR *dir = opendir(dir_path.c_str()); 
+    if (!dir)
+    {
+        if (errno == EACCES)
+            return 403;
+        return 500;
+    }
+
+    std::stringstream ss;
+    ss << "<html><body><h1>Index of " << html_escape(request_path) << "</h1><ul>";
+
+    struct dirent *entry;                  
+    while ((entry = readdir(dir)) != NULL)
+    {
+        std::string name = entry->d_name;
+
+        if (name == ".")
+            continue;
+
+        ss << "<li><a href=\"" << html_escape(join_url_path(request_path, name)) << "\">" << html_escape(name) << "</a></li>";
+    }
+
+    closedir(dir);
+    ss << "</ul></body></html>";
+    body = ss.str();
+    return 200;
+}
+
+std::string Client::build_file_path(const ServerConfig &config, const LocationConfig *loc, const std::string &url_path) const
+{
+    std::string root;
+
+    if (loc && !loc->root.empty())
+        root = loc->root;
+    else
+        root = config.root;
+
+    std::string relative_path = url_path;
+
+    if (loc && loc->path != "/" &&
+        relative_path.compare(0, loc->path.size(), loc->path) == 0)
+    {
+        relative_path = relative_path.substr(loc->path.size());
+    }
+
+    if (relative_path.empty())
+        relative_path = "/";
+
+    if (relative_path == "/")
+        return root;
+
+    return root + relative_path;
+}
+
+std::string Client::build_file_path(const ServerConfig &config, const LocationConfig *loc) const
+{
+    return build_file_path(config, loc, this->get_path());
+}
+
+bool Client::handle_get_req(ServerConfig &config, const LocationConfig *loc)
+{
+    std::string file_path; 
+    std::string directory_path;
+    std::string index;    
+    struct stat file_stat; 
+
+    file_path = build_file_path(config, loc);
+
+    if (stat(file_path.c_str(), &file_stat) == -1)
+    {
+        if (errno == EACCES)
+            build_error_response(403, config, loc);
+        else if (errno == ENOENT || errno == ENOTDIR)
+            build_error_response(404, config, loc);
+        else
+            build_error_response(500, config, loc);
+        return true;
+    }
+
+    if (S_ISDIR(file_stat.st_mode))
+    {
+        directory_path = file_path;
+        if (loc && !loc->index.empty())
+            index = loc->index;
+        else
+            index = config.index;
+
+        if (file_path.empty() || file_path[file_path.size() - 1] != '/')
+            file_path += "/";
+        file_path += index;
+
+        if (stat(file_path.c_str(), &file_stat) == -1)
+        {
+            if (errno == EACCES) 
+                build_error_response(403, config, loc);
+            else if (errno == ENOENT || errno == ENOTDIR) 
+            {
+                int autoindex_value = config.autoindex;
+                if (loc && loc->autoindex != -1)
+                    autoindex_value = loc->autoindex;
+                if (autoindex_value != 1)
+                    build_error_response(404, config, loc);
+                else
+                {
+                    this->res.status_code = build_autoindex_body(directory_path, this->get_path(), this->res.body);
+                    if (this->res.status_code != 200)
+                        build_error_response(this->res.status_code, config, loc);
+                    else
+                    {
+                        this->res.reason = "OK";
+                        this->res.content_type = "text/html";
+                    }
+                }
+            }
+            else
+                build_error_response(500, config, loc);
+            return true;
+        }
+    }
+    if (!S_ISREG(file_stat.st_mode))
+    {
+        build_error_response(403, config, loc);
+        return true;
+    }
+
+    this->res.reason = "OK";
+    this->res.content_type = get_content_type(file_path);
+
+    this->res.status_code = read_file(file_path, this->res.body);
+    if (this->res.status_code != 200)
+        build_error_response(this->res.status_code, config, loc);
+
+    return true;
+}
+
+int Client::write_uploaded_file(const std::string &file_path, const std::string &data)
+{
+    int file_fd = open(file_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644); 
+
+    if (file_fd == -1)
+    {
+        if (errno == EEXIST)
+            return 409;
+        if (errno == EACCES)
+            return 403;
+        return 500;
+    }
+
+    size_t total_written = 0;
+
+    while (total_written < data.size())
+    {
+        ssize_t written = write(file_fd, data.c_str() + total_written, data.size() - total_written);
+
+        if (written == -1)
+        {
+            close(file_fd);
+            return 500;
+        }
+
+        if (written == 0)
+        {
+            close(file_fd);
+            return 500;
+        }
+
+        total_written += static_cast<size_t>(written);
+    }
+
+    if (close(file_fd) == -1)
+        return 500;
+
+    return 201;
+}
+
+bool Client::extract_multipart_boundary(const std::string &content_type, std::string &boundary) const
+{
+    boundary.clear();
+
+    std::string lower_content_type = content_type;
+    to_lower(lower_content_type);
+
+    if (lower_content_type.find("multipart/form-data") == std::string::npos) 
+        return false;
+
+    const std::string marker = "boundary=";
+
+    size_t boundary_start = lower_content_type.find(marker);
+
+    if (boundary_start == std::string::npos)
+        return false;
+
+    boundary_start += marker.size(); 
+
+    while (boundary_start < content_type.size() && (content_type[boundary_start] == ' ' || content_type[boundary_start] == '\t'))
+        ++boundary_start;
+
+    if (boundary_start >= content_type.size())
+        return false;
+
+    if (content_type[boundary_start] == '"') 
+    {
+        size_t boundary_end =
+            content_type.find('"', boundary_start + 1);
+
+        if (boundary_end == std::string::npos)
+            return false;
+
+        boundary = content_type.substr(
+            boundary_start + 1,
+            boundary_end - boundary_start - 1);
+    }
+    else
+    {
+        size_t boundary_end =
+            content_type.find(';', boundary_start);
+
+        if (boundary_end == std::string::npos)
+            boundary_end = content_type.size();
+
+        boundary = trim(
+            content_type.substr(
+                boundary_start,
+                boundary_end - boundary_start));
+    }
+
+    if (boundary.empty())
+        return false;
+
+    if (boundary.find('\r') != std::string::npos || boundary.find('\n') != std::string::npos)
+    {
+        boundary.clear();
+        return false;
+    }
+
+    return true;
+}
+
+bool Client::parse_multipart_part_headers(const std::string &headers_block, MultipartPart &part) const
+{
+    part.name.clear();
+    part.filename.clear();
+    part.content_type.clear();
+    part.data.clear();
+
+    bool has_content_disposition = false;
+    bool has_content_type = false;
+
+    size_t line_start = 0;
+
+    while (line_start < headers_block.size())
+    {
+        size_t line_end = headers_block.find("\r\n", line_start);
+
+        if (line_end == std::string::npos)
+            line_end = headers_block.size();
+
+        std::string line = headers_block.substr(line_start, line_end - line_start);
+
+        if (line.empty())
+            return false;
+
+        size_t colon = line.find(':');
+
+        if (colon == std::string::npos || colon == 0)
+            return false;
+
+        std::string key = line.substr(0, colon);
+
+        if (key.find_first_of(" \t") != std::string::npos)
+            return false;
+
+        std::string value = trim(line.substr(colon + 1));
+
+        to_lower(key);
+
+        if (key == "content-disposition")
+        {
+            if (has_content_disposition)
+                return false;
+
+            has_content_disposition = true;
+
+            size_t first_semicolon = value.find(';');
+
+            std::string disposition;
+
+            if (first_semicolon == std::string::npos)
+                disposition = trim(value);
+            else
+                disposition = trim(value.substr(0, first_semicolon));
+
+            to_lower(disposition);
+
+            if (disposition != "form-data")
+                return false;
+
+            if (first_semicolon == std::string::npos)
+                return false;
+
+            size_t pos = first_semicolon + 1;
+            bool has_name = false;
+            bool has_filename = false;
+
+            while (pos < value.size())
+            {
+
+                while (pos < value.size() && (value[pos] == ' ' || value[pos] == '\t' || value[pos] == ';'))
+                    ++pos;
+
+                if (pos >= value.size())
+                    break;
+
+                size_t equal = value.find('=', pos);
+
+                if (equal == std::string::npos)
+                    return false;
+
+                size_t semicolon_before_equal = value.find(';', pos);
+
+                if (semicolon_before_equal != std::string::npos && semicolon_before_equal < equal)
+                    return false;
+
+                std::string parameter_name = trim(value.substr(pos, equal - pos));
+                to_lower(parameter_name);
+                pos = equal + 1;
+                while (pos < value.size() && (value[pos] == ' ' || value[pos] == '\t'))
+                    ++pos;
+                if (pos >= value.size())
+                    return false;
+
+                std::string parameter_value;
+                if (value[pos] == '"')
+                {
+                    ++pos;
+
+                    size_t closing_quote = value.find('"', pos);
+
+                    if (closing_quote == std::string::npos)
+                        return false;
+
+                    parameter_value =
+                        value.substr(pos, closing_quote - pos);
+
+                    pos = closing_quote + 1;
+
+                    while (pos < value.size() && (value[pos] == ' ' || value[pos] == '\t'))
+                        ++pos;
+
+                    if (pos < value.size() && value[pos] != ';')
+                        return false;
+                }
+                else
+                {
+                    size_t parameter_end = value.find(';', pos);
+
+                    if (parameter_end == std::string::npos)
+                        parameter_end = value.size();
+
+                    parameter_value = trim(value.substr(pos, parameter_end - pos));
+                    pos = parameter_end;
+                }
+
+                if (parameter_value.find('\r') != std::string::npos || parameter_value.find('\n') != std::string::npos)
+                    return false;
+
+                if (parameter_name == "name")
+                {
+                    if (has_name)
+                        return false;
+
+                    part.name = parameter_value;
+                    has_name = true;
+                }
+                else if (parameter_name == "filename")
+                {
+                    if (has_filename)
+                        return false;
+
+                    part.filename = parameter_value;
+                    has_filename = true;
+                }
+            }
+            if (!has_name || part.name.empty())
+                return false;
+        }
+        else if (key == "content-type")
+        {
+            if (has_content_type)
+                return false;
+
+            if (value.empty())
+                return false;
+
+            part.content_type = value;
+            has_content_type = true;
+        }
+        if (line_end == headers_block.size())
+            break;
+
+        line_start = line_end + 2;
+    }
+
+    return has_content_disposition;
+}
+
+int Client::parse_multipart_body(const std::string &body, const std::string &boundary, std::vector<MultipartPart> &parts) const
+{
+    parts.clear();
+
+    if (body.empty() || boundary.empty())
+        return 400;
+
+    std::string delimiter = "--" + boundary;
+    if (body.compare(0, delimiter.size(), delimiter) != 0)
+        return 400;
+
+    size_t pos = delimiter.size();
+
+    while (pos < body.size())
+    {
+        if (body.compare(pos, 2, "--") == 0)
+        {
+            if (parts.empty())
+                return 400;
+            else
+                return 0;
+        }
+        if (body.compare(pos, 2, "\r\n") != 0)
+            return 400;
+
+        pos += 2;
+
+        size_t headers_end = body.find("\r\n\r\n", pos);
+
+        if (headers_end == std::string::npos)
+            return 400;
+
+        std::string headers_block = body.substr(pos, headers_end - pos);
+
+        MultipartPart part;
+
+        if (!parse_multipart_part_headers(headers_block, part))
+            return 400;
+
+        size_t data_start = headers_end + 4;
+
+
+        std::string next_marker = "\r\n" + delimiter;
+
+        size_t next_boundary = body.find(next_marker, data_start);
+
+        if (next_boundary == std::string::npos)
+            return 400;
+
+        part.data = body.substr(data_start, next_boundary - data_start);
+
+        parts.push_back(part);
+
+        pos = next_boundary + 2 + delimiter.size();
+    }
+
+    return 400;
+}
+
+int Client::handle_raw_upload(const LocationConfig *loc)
+{
+    std::string request_path = this->get_path();
+    std::string file_name;
+
+    if (request_path.compare(0, loc->path.size(), loc->path) != 0)
+        return 400;
+
+    file_name = request_path.substr(loc->path.size());
+
+    if (!file_name.empty() && file_name[0] == '/')
+        file_name.erase(0, 1);
+
+    if (file_name.empty())
+    {
+        std::stringstream ss;
+
+        ss << "upload_" << time(NULL) << "_" << this->client_fd;
+        file_name = ss.str();
+    }
+
+    if (file_name == "." || file_name == ".." ||
+        file_name.find('/') != std::string::npos ||
+        file_name.find('\\') != std::string::npos)
+        return 400;
+
+    std::string file_path = loc->upload_path;
+
+    if (!file_path.empty() && file_path[file_path.size() - 1] != '/')
+        file_path += "/";
+
+    file_path += file_name;
+
+    return write_uploaded_file(file_path, this->req.body);
+}
+
+int Client::handle_multipart_upload(const LocationConfig *loc, const std::string &content_type)
+{
+    std::string boundary;
+
+    if (!extract_multipart_boundary(content_type, boundary))
+        return 400;
+
+    std::vector<MultipartPart> parts;
+
+    int status = parse_multipart_body(this->req.body, boundary, parts);
+
+    if (status != 0)
+        return status;
+
+    bool file_saved = false;
+
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        if (parts[i].filename.empty())
+            continue;
+
+        std::string file_name = parts[i].filename;
+
+        if (file_name == "." || file_name == ".." || file_name.find('/') != std::string::npos || file_name.find('\\') != std::string::npos)
+            return 400;
+
+        std::string file_path = loc->upload_path;
+
+        if (!file_path.empty() && file_path[file_path.size() - 1] != '/')
+            file_path += "/";
+
+        file_path += file_name;
+
+        int upload_status = write_uploaded_file(file_path, parts[i].data);
+
+        if (upload_status != 201)
+            return upload_status;
+
+        file_saved = true;
+    }
+
+    if (!file_saved)
+        return 400;
+
+    return 201;
+}
+
+bool Client::handle_post_req(ServerConfig &config, const LocationConfig *loc)
+{
+    if (!loc)
+    {
+        build_error_response(404, config, loc);
+        return true;
+    }
+
+    if (loc->upload_path.empty())
+    {
+        build_error_response(403, config, loc);
+        return true;
+    }
+
+    struct stat upload_stat;
+
+    if (stat(loc->upload_path.c_str(), &upload_stat) == -1)
+    {
+        {
+            std::cerr << "UPLOAD PATH: [" << loc->upload_path << "]" << std::endl;
+            std::cerr << "STAT ERROR: " << strerror(errno) << std::endl;
+
+            if (errno == EACCES)
+                build_error_response(403, config, loc);
+            else
+                build_error_response(500, config, loc);
+
+            return true;
+        }
+    }
+
+    if (!S_ISDIR(upload_stat.st_mode))
+    {
+        build_error_response(500, config, loc);
+        return true;
+    }
+    std::string content_type = this->get_header("content-type");
+
+    std::string lower_content_type = content_type;
+    to_lower(lower_content_type);
+    if (this->req.body.empty())
+    {
+        this->res.status_code = 200;
+        this->res.reason = "OK";
+        this->res.content_type = "text/plain";
+        this->res.body = "";
+        return true;
+    }
+
+    int upload_status;
+    if (lower_content_type.find("multipart/form-data") != std::string::npos)
+        upload_status = handle_multipart_upload(loc, content_type);
+    else
+        upload_status = handle_raw_upload(loc);
+
+    if (upload_status != 201)
+    {
+        build_error_response(upload_status, config, loc);
+        return true;
+    }
+
+    this->res.status_code = 201;
+    this->res.reason = "Created";
+    this->res.content_type = "text/plain";
+    this->res.body = "File uploaded successfully\n";
+
+    return true;
+}
+
+bool Client::handle_delete_req(ServerConfig &config, const LocationConfig *loc)
+{
+    std::string file_path;
+    struct stat file_stat;
+
+    file_path = build_file_path(config, loc); 
+
+    if (stat(file_path.c_str(), &file_stat) == -1)
+    {
+        if (errno == EACCES)
+            build_error_response(403, config, loc);
+        else if (errno == ENOENT || errno == ENOTDIR)
+            build_error_response(404, config, loc);
+        else
+            build_error_response(500, config, loc);
+
+        return true;
+    }
+
+    if (!S_ISREG(file_stat.st_mode))
+    {
+        build_error_response(403, config, loc);
+        return true;
+    }
+
+    if (std::remove(file_path.c_str()) != 0)
+    {
+        if (errno == EACCES || errno == EPERM)
+            build_error_response(403, config, loc);
+        else if (errno == ENOENT || errno == ENOTDIR)
+            build_error_response(404, config, loc);
+        else
+            build_error_response(500, config, loc);
+
+        return true;
+    }
+    this->res.status_code = 204;
+    this->res.reason = "No Content";
+    this->res.content_type.clear();
+    this->res.body.clear();
+
+    return true;
+}
+
+const LocationConfig *Client::match_location(const ServerConfig &config) const
+{
+    const LocationConfig *best = NULL;
+    size_t best_len = 0;
+    const std::string &path = this->get_path();
+
+    for (size_t i = 0; i < config.locations.size(); ++i)
+    {
+        const LocationConfig &l = config.locations[i];
+        if (l.path.empty())
+            continue;
+        if (path.compare(0, l.path.size(), l.path) != 0)
+            continue;
+        if (l.path != "/" && path.size() > l.path.size() && path[l.path.size()] != '/')
+            continue;
+        if (l.path.size() > best_len)
+        {
+            best = &l;
+            best_len = l.path.size();
+        }
+    }
+    return best;
+}
+
+bool Client::is_method_allowed(const std::vector<std::string> &allowed) const
+{
+    for (size_t i = 0; i < allowed.size(); ++i)
+        if (allowed[i] == this->get_method())
+            return true;
+    return false;
+}
+
+int Client::sanitize_path()
+{
+    std::string &path = req.path;
+    std::vector<std::string> segs;
+
+    size_t i = 1;
+    while (i <= path.size())
+    {
+        size_t j = path.find('/', i);
+        if (j == std::string::npos)
+            j = path.size();
+        std::string seg = path.substr(i, j - i);
+
+        if (seg == "..")
+        {
+            if (segs.empty())
+                return 403;
+            segs.pop_back();
+        }
+        else if (!seg.empty() && seg != ".")
+            segs.push_back(seg);
+        i = j + 1;
+    }
+
+    bool trailing_slash = path.size() > 1 && path[path.size() - 1] == '/';
+    path = "/";
+    for (size_t k = 0; k < segs.size(); ++k)
+    {
+        path += segs[k];
+        if (k + 1 < segs.size())
+            path += "/";
+    }
+    if (trailing_slash && path != "/")
+        path += "/";
+    return 0;
+}
+
+int Client::validate_req(ServerConfig &config, const LocationConfig *&loc)
+{
+    if (this->get_version() != "HTTP/1.1")
+        return 505;
+
+    int status = sanitize_path();
+    if (status != 0)
+        return status;
+
+    loc = match_location(config);
+
+    const std::vector<std::string> *allowed;
+
+    if (loc && !loc->allowed_methods.empty())
+        allowed = &loc->allowed_methods;
+    else
+        allowed = &config.allowed_methods;
+
+    if (!is_method_allowed(*allowed))
+    {
+        std::string allow;
+
+        for (size_t i = 0; i < allowed->size(); ++i)
+        {
+            if (i > 0)
+                allow += ", ";
+            allow += (*allowed)[i];
+        }
+
+        this->res.headers["Allow"] = allow;
+        return 405;
+    }
+
+    if (this->req.headers.count("content-length"))
+    {
+        long content_length;
+
+        if (!string_to_long(
+                this->req.headers["content-length"],
+                content_length))
+            return 400;
+
+        if (content_length < 0)
+            return 400;
+
+        size_t max_body_size;
+
+        if (loc)
+            max_body_size = loc->location_max_body_size;
+        else
+            max_body_size = config.client_max_body_size;
+
+        if (static_cast<size_t>(content_length) > max_body_size)
+            return 413;
+    }
+
+    return 0;
+}
+
+void Client::build_redirect_response(const LocationConfig &loc)
+{
+    this->res.status_code = loc.redirect_code;
+
+    if (loc.redirect_code == 301)
+        this->res.reason = "Moved Permanently";
+    else if (loc.redirect_code == 302)
+        this->res.reason = "Found";
+    else if (loc.redirect_code == 303)
+        this->res.reason = "See Other";
+    else if (loc.redirect_code == 307)
+        this->res.reason = "Temporary Redirect";
+    else if (loc.redirect_code == 308)
+        this->res.reason = "Permanent Redirect";
+    else
+    {
+        build_default_error_response(500);
+        return;
+    }
+
+    this->res.content_type = "text/html";
+    this->res.body.clear();
+    this->res.headers["Location"] = loc.redirect_url;
+}
+
+bool Client::split_cgi_path(const LocationConfig *loc, std::string &script_name, std::string &path_info, std::string &interpreter) const
+{
+    if (!loc || loc->cgi_handlers.empty())
+        return false;
+
+    const std::string &path = this->req.path;
+
+    for (std::map<std::string, std::string>::const_iterator it = loc->cgi_handlers.begin();
+         it != loc->cgi_handlers.end(); ++it)
+    {
+        const std::string &ext = it->first;
+        size_t pos = 0;
+
+        while ((pos = path.find(ext, pos)) != std::string::npos)
+        {
+            size_t end = pos + ext.size();
+
+            if (end == path.size() || path[end] == '/')
+            {
+                script_name = path.substr(0, end);
+                path_info = path.substr(end);
+                interpreter = it->second;
+                return true;
+            }
+
+            pos = end;
+        }
+    }
+    return false;
+}
+
+bool Client::parse_cgi_output(const std::string &output)
+{
+    size_t sep_len = 2;
+    size_t headers_end = output.find("\n\n");
+    size_t crlf = output.find("\r\n\r\n");
+
+    if (crlf != std::string::npos && (headers_end == std::string::npos || crlf < headers_end))
+    {
+        headers_end = crlf;
+        sep_len = 4;
+    }
+
+    if (headers_end == std::string::npos)
+        return false;
+
+    std::string headers_part = output.substr(0, headers_end);
+
+    this->res.body = output.substr(headers_end + sep_len);
+    this->res.status_code = 200;
+    this->res.reason = "OK";
+    this->res.content_type = "text/html";
+
+    size_t line_start = 0;
+
+    while (line_start < headers_part.size())
+    {
+        size_t line_end = headers_part.find('\n', line_start);
+
+        if (line_end == std::string::npos)
+            line_end = headers_part.size();
+
+        std::string line = headers_part.substr(line_start, line_end - line_start);
+        line_start = line_end + 1;
+
+        if (!line.empty() && line[line.size() - 1] == '\r')
+            line.erase(line.size() - 1);
+
+        if (line.empty())
+            continue;
+
+        size_t colon = line.find(':');
+
+        if (colon == std::string::npos || colon == 0)
+            return false;
+
+        std::string key = line.substr(0, colon);
+        std::string value = trim(line.substr(colon + 1));
+        std::string lower(key);
+
+        to_lower(lower);
+
+        if (lower == "content-type")
+            this->res.content_type = value;
+        else if (lower == "status")
+        {
+            size_t space = value.find(' ');
+            std::string code_str = value;
+
+            if (space != std::string::npos)
+                code_str = value.substr(0, space);
+
+            long code;
+
+            if (!string_to_long(code_str, code) || code < 100 || code > 599)
+                return false;
+
+            this->res.status_code = static_cast<int>(code);
+
+            if (space != std::string::npos && space + 1 < value.size())
+                this->res.reason = value.substr(space + 1);
+            else
+                this->res.reason = get_error_reason(static_cast<int>(code));
+        }
+
+        else if (lower != "content-length")
+            this->res.headers[key] = value;
+    }
+
+    return true;
+}
+
+bool Client::finish_cgi(const std::string &output, ServerConfig &config)
+{
+    const LocationConfig *loc = match_location(config);
+
+    if (!parse_cgi_output(output))
+        build_error_response(502, config, loc);
+
+    build_response_buffer();
+    clear_cgi();
+
+    return true;
+}
+
+bool Client::exec_cgi(const std::string &script_path, const std::string &script_name, const std::string &path_info, const std::string &interpreter)
+{
+    int fds[2];
+    int in_fds[2];
+
+    if (pipe(fds) == -1)
+    {
+        std::cerr << "Error: pipe failed: " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    if (pipe(in_fds) == -1)
+    {
+        std::cerr << "Error: pipe failed: " << strerror(errno) << std::endl;
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+
+    std::string script_dir;
+    std::string script_file = script_path;
+
+    size_t slash = script_path.rfind('/');
+
+    if (slash != std::string::npos)
+    {
+        script_dir = script_path.substr(0, slash);
+        script_file = script_path.substr(slash + 1);
+    }
+    std::stringstream c_len;
+    c_len << this->req.body.size();
+
+    std::string request_uri = this->req.path;
+    if (!this->req.query_string.empty())
+        request_uri += "?" + this->req.query_string;
+
+    std::vector<std::string> env;
+    env.push_back("GATEWAY_INTERFACE=CGI/1.1");
+    env.push_back("SERVER_PROTOCOL=HTTP/1.1");
+    env.push_back("REQUEST_METHOD=" + this->req.method);
+    env.push_back("QUERY_STRING=" + this->req.query_string);
+    env.push_back("SCRIPT_NAME=" + script_name);
+    env.push_back("SCRIPT_FILENAME=" + script_file);
+    env.push_back("REQUEST_URI=" + request_uri);
+    env.push_back("HTTP_HOST=" + this->get_header("host"));
+    env.push_back("PATH_INFO=" + path_info);
+    env.push_back("CONTENT_LENGTH=" + c_len.str());
+    env.push_back("CONTENT_TYPE=" + this->get_header("content-type"));
+    env.push_back("REDIRECT_STATUS=200");
+    for (std::map<std::string, std::string>::const_iterator it = this->req.headers.begin();
+         it != this->req.headers.end(); ++it)
+    {
+        std::string name = it->first;
+
+        for (size_t i = 0; i < name.size(); ++i)
+        {
+            if (name[i] == '-')
+                name[i] = '_';
+            else
+                name[i] = static_cast<char>(toupper(static_cast<unsigned char>(name[i])));
+        }
+
+        if (name == "CONTENT_LENGTH" || name == "CONTENT_TYPE")
+            continue;
+
+        env.push_back("HTTP_" + name + "=" + it->second);
+    }
+    std::vector<char *> envp;
+    for (size_t i = 0; i < env.size(); ++i)
+        envp.push_back(const_cast<char *>(env[i].c_str()));
+
+    envp.push_back(NULL);
+
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        std::cerr << "Error: fork failed: " << strerror(errno) << std::endl;
+        close(fds[0]);
+        close(fds[1]);
+        close(in_fds[0]);
+        close(in_fds[1]);
+        return false;
+    }
+
+    if (pid == 0)
+    {
+        close(fds[0]);
+        close(in_fds[1]);
+
+        if (dup2(fds[1], STDOUT_FILENO) == -1)
+            _exit(1);
+
+        if (dup2(in_fds[0], STDIN_FILENO) == -1)
+            _exit(1);
+
+        close(fds[1]);
+        close(in_fds[0]);
+
+        if (!script_dir.empty() && chdir(script_dir.c_str()) == -1)
+            _exit(1);
+
+        char *argv[3];
+        argv[0] = const_cast<char *>(interpreter.c_str());
+        argv[1] = const_cast<char *>(script_file.c_str());
+        argv[2] = NULL;
+
+        execve(argv[0], argv, &envp[0]);
+        _exit(1);
+    }
+
+    close(fds[1]);
+    close(in_fds[0]);
+
+    if (!set_nonblocking(fds[0]))
+    {
+        close(fds[0]);
+        close(in_fds[1]);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return false;
+    }
+
+    if (this->req.body.empty())
+    {
+        close(in_fds[1]);
+        this->cgi_in_fd = -1;
+    }
+    else
+    {
+        if (!set_nonblocking(in_fds[1]))
+        {
+            close(fds[0]);
+            close(in_fds[1]);
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            return false;
+        }
+
+        this->cgi_in_fd = in_fds[1];
+    }
+
+    this->cgi_fd = fds[0];
+    this->cgi_pid = pid;
+
+    return true;
+}
+
+bool Client::prepare_response(ServerConfig &config)
+{
+    if (!this->clear_response())
+        return false;
+
+    this->res.headers.clear();
+    const LocationConfig *loc = NULL;
+    int status = validate_req(config, loc);
+
+    if (status != 0)
+    {
+        build_error_response(status, config, loc);
+        build_response_buffer();
+        return true;
+    }
+
+    if (loc && loc->redirect_code != 0)
+    {
+        build_redirect_response(*loc);
+        build_response_buffer();
+        return true;
+    }
+
+    std::string script_name;
+    std::string interpreter;
+    std::string path_info;
+
+    if (split_cgi_path(loc, script_name, path_info, interpreter))
+    {
+        std::string script_path = build_file_path(config, loc, script_name);
+
+        std::string cgi_path_info = script_name + path_info;
+
+        if (DEBUG)
+            std::cout << "CGI: " << interpreter << " " << script_path
+                      << " PATH_INFO=" << cgi_path_info << std::endl;
+
+        if (!exec_cgi(script_path, script_name, cgi_path_info, interpreter))
+        {
+            build_error_response(500, config, loc);
+            build_response_buffer();
+            return true;
+        }
+
+        return true;
+    }
+
+    if (this->get_method() == "GET")
+        handle_get_req(config, loc);
+    else if (this->get_method() == "POST")
+        handle_post_req(config, loc);
+    else if (this->get_method() == "DELETE")
+        handle_delete_req(config, loc);
+    else
+        build_error_response(501, config, loc);
+
+    build_response_buffer();
+    return true;
+}
